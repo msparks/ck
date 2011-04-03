@@ -55,10 +55,13 @@ enum {
 struct ck_epoch;
 struct ck_epoch_record {
 	unsigned int active;
-	unsigned int status;
 	unsigned int epoch;
 	ck_stack_t pending[CK_EPOCH_LENGTH];
+	unsigned int n_pending;
+	unsigned int status;
 	unsigned int delta;
+	unsigned int n_peak;
+	uint64_t     n_reclamations;
 	struct ck_epoch *global;
 	ck_stack_entry_t record_next;
 } CK_CC_CACHELINE;
@@ -125,6 +128,9 @@ ck_epoch_register(struct ck_epoch *global, struct ck_epoch_record *record)
 	record->active = 0;
 	record->epoch = 0;
 	record->delta = 0;
+	record->n_pending = 0;
+	record->n_peak = 0;
+	record->n_reclamations = 0;
 	record->global = global;
 
 	for (i = 0; i < CK_EPOCH_LENGTH; i++)
@@ -138,26 +144,40 @@ ck_epoch_register(struct ck_epoch *global, struct ck_epoch_record *record)
 CK_CC_INLINE static void
 ck_epoch_unregister(struct ck_epoch_record *record)
 {
+	size_t i;
 
 	record->status = CK_EPOCH_FREE;
+	record->active = 0;
+	record->epoch = 0;
+	record->delta = 0;
+	record->n_pending = 0;
+	record->n_peak = 0;
+	record->n_reclamations = 0;
+
+	for (i = 0; i < CK_EPOCH_LENGTH; i++)
+		ck_stack_init(&record->pending[i]);
+
 	ck_pr_inc_uint(&record->global->n_free);
 	ck_pr_fence_store();
 	return;
 }
 
 CK_CC_INLINE static void
-ck_epoch_update(struct ck_epoch *global, struct ck_epoch_record *record)
+ck_epoch_tick(struct ck_epoch *global, struct ck_epoch_record *record)
 {
 	struct ck_epoch_record *c_record;
 	ck_stack_entry_t *cursor;
 	unsigned int g_epoch = ck_pr_load_uint(&global->epoch);
 
+	g_epoch &= CK_EPOCH_LENGTH - 1;
 	CK_STACK_FOREACH(&global->records, cursor) {
 		c_record = ck_epoch_record_container(cursor);
-		if (ck_pr_load_uint(&c_record->status) == CK_EPOCH_FREE || c_record == record)
+		if (ck_pr_load_uint(&c_record->status) == CK_EPOCH_FREE ||
+		    c_record == record)
 			continue;
 
-		if (ck_pr_load_uint(&c_record->active) == true && ck_pr_load_uint(&c_record->epoch) != g_epoch)
+		if (ck_pr_load_uint(&c_record->active) == true &&
+		    ck_pr_load_uint(&c_record->epoch) != g_epoch)
 			return;
 	}
 
@@ -165,54 +185,52 @@ ck_epoch_update(struct ck_epoch *global, struct ck_epoch_record *record)
 	return;
 }
 
-CK_CC_INLINE static void
-ck_epoch_activate(struct ck_epoch_record *record)
+CK_CC_INLINE static bool
+ck_epoch_reclaim(struct ck_epoch_record *record)
 {
+	struct ck_epoch *global = record->global;
+	unsigned int g_epoch = ck_pr_load_uint(&global->epoch);
+	unsigned int epoch = record->epoch;
+	ck_stack_entry_t *next, *cursor;
+
+	g_epoch &= CK_EPOCH_LENGTH - 1;
+	if (epoch == g_epoch)
+		return false;
+
+	/*
+	 * This means all threads with a potential reference to a
+	 * hazard pointer will have a view as new as or newer than
+	 * the calling thread. No active reference should exist to
+	 * any object in the record's pending list.
+	 */
+	CK_STACK_FOREACH_SAFE(&record->pending[g_epoch], cursor, next) {
+		global->destroy(cursor);
+		record->n_pending--;
+		record->n_reclamations++;
+	}
+
+	ck_stack_init(&record->pending[g_epoch]);
+	record->epoch = g_epoch;
+	record->delta = 0;
+
+	return true;
+}
+
+CK_CC_INLINE static void
+ck_epoch_write_begin(struct ck_epoch_record *record)
+{
+	struct ck_epoch *global = record->global;
 
 	ck_pr_store_uint(&record->active, 1);
 	ck_pr_fence_store();
-	return;
-}
-
-CK_CC_INLINE static void
-ck_epoch_deactivate(struct ck_epoch_record *record)
-{
-
-	ck_pr_fence_store();
-	ck_pr_store_uint(&record->active, 0);
-	return;
-}
-
-CK_CC_INLINE static void
-ck_epoch_start(struct ck_epoch_record *record)
-{
-	struct ck_epoch *global = record->global;
-	unsigned int g_epoch;
 
 	for (;;) {
-		g_epoch = ck_pr_load_uint(&global->epoch);
-		if (record->epoch != g_epoch) {
-			ck_stack_entry_t *next, *cursor;
-			unsigned int epoch = record->epoch & (CK_EPOCH_LENGTH - 1);
-
-			/*
-			 * This means all threads with a potential reference to a hazard pointer
-			 * will have a view as new as or newer than the calling thread. No active
-			 * reference should exist to any object in the record's pending list.
-			 */
-			CK_STACK_FOREACH_SAFE(&record->pending[epoch], cursor, next)
-				global->destroy(cursor);
-
-			ck_stack_init(&record->pending[epoch]);
-
-			ck_pr_store_uint(&record->epoch, g_epoch);
-			record->delta = 0;
+		if (ck_epoch_reclaim(record) == true)
 			break;
-		}
 
 		if (++record->delta >= global->threshold) {
 			record->delta = 0;
-			ck_epoch_update(global, record);
+			ck_epoch_tick(global, record);
 			continue;
 		}
 
@@ -223,18 +241,14 @@ ck_epoch_start(struct ck_epoch_record *record)
 }
 
 CK_CC_INLINE static void
-ck_epoch_stop(struct ck_epoch_record *record CK_CC_UNUSED)
+ck_epoch_read_begin(struct ck_epoch_record *record)
 {
+	unsigned int g_epoch = ck_pr_load_uint(&record->global->epoch);
 
-	return;
-}
-
-CK_CC_INLINE static void
-ck_epoch_begin(struct ck_epoch_record *record)
-{
-
-	ck_epoch_activate(record);
-	ck_epoch_start(record);
+	g_epoch &= CK_EPOCH_LENGTH - 1;
+	ck_pr_store_uint(&record->epoch, g_epoch);
+	ck_pr_store_uint(&record->active, 1);
+	ck_pr_fence_store();
 	return;
 }
 
@@ -242,26 +256,50 @@ CK_CC_INLINE static void
 ck_epoch_end(struct ck_epoch_record *record)
 {
 
-	ck_epoch_deactivate(record);
+	ck_pr_fence_store();
+	ck_pr_store_uint(&record->active, 0);
 	return;
 }
 
 CK_CC_INLINE static void
-ck_epoch_flush(struct ck_epoch_record *record)
+ck_epoch_retire(struct ck_epoch_record *record, ck_stack_entry_t *entry)
 {
 
-	ck_epoch_update(record->global, record);
-	ck_epoch_start(record);
+	ck_stack_push_spnc(&record->pending[record->epoch], entry);
+	record->n_pending += 1;
 	return;
 }
 
 CK_CC_INLINE static void
 ck_epoch_free(struct ck_epoch_record *record, ck_stack_entry_t *entry)
 {
-	unsigned int epoch = ck_pr_load_uint(&record->epoch) & (CK_EPOCH_LENGTH - 1);
+	unsigned int epoch = ck_pr_load_uint(&record->epoch);
+	struct ck_epoch *global = record->global;
 
 	ck_stack_push_spnc(&record->pending[epoch], entry);
-	record->delta++;
+	record->n_pending += 1;
+
+	if (record->n_pending > record->n_peak)
+		record->n_peak = record->n_pending;
+
+	if (record->n_pending >= global->threshold && ck_epoch_reclaim(record) == false)
+		ck_epoch_tick(global, record);
+
+	return;
+}
+
+CK_CC_INLINE static void
+ck_epoch_purge(struct ck_epoch_record *record)
+{
+	ck_backoff_t backoff = CK_BACKOFF_INITIALIZER;
+
+	while (record->n_pending > 0) {
+		ck_epoch_reclaim(record);
+		ck_epoch_tick(record->global, record);
+		if (record->n_pending > 0)
+			ck_backoff_gb(&backoff);
+	}
+
 	return;
 }
 
